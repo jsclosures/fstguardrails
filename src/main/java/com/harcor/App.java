@@ -868,11 +868,18 @@ public class App {
             String rawId  = extractRawId(json);
 
             switch (method) {
-                case "initialize"                -> handleInitialize(rawId);
-                case "notifications/initialized" -> { /* notification — no reply */ }
-                case "tools/list"                -> handleToolsList(rawId);
-                case "tools/call"                -> handleToolsCall(rawId, json);
-                default                          ->
+                case "initialize":
+                    handleInitialize(rawId);
+                    break;
+                case "notifications/initialized":
+                    break; // notification — no reply
+                case "tools/list":
+                    handleToolsList(rawId);
+                    break;
+                case "tools/call":
+                    handleToolsCall(rawId, json);
+                    break;
+                default:
                     sendError(rawId, -32601, "Method not found: " + method);
             }
         }

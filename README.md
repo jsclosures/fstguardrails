@@ -36,9 +36,8 @@ token — ready to route, filter, or log without any downstream NLP.
 
 ## Requirements
 
-- Java 17+  
-- Maven 3.6+  
-(Both provided by the GraalVM 22.3 module in this environment.)
+- Java 17+
+- Maven 3.6+
 
 ## Build
 

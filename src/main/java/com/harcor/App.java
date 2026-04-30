@@ -869,7 +869,7 @@ public class App {
 
             switch (method) {
                 case "initialize"                -> handleInitialize(rawId);
-                case "notifications/initialized" -> { /* notification — no reply */ };
+                case "notifications/initialized" -> { /* notification — no reply */ }
                 case "tools/list"                -> handleToolsList(rawId);
                 case "tools/call"                -> handleToolsCall(rawId, json);
                 default                          ->

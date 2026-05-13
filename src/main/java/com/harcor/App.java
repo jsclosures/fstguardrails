@@ -480,13 +480,19 @@ public class App {
 
     // ── Shared JSON helpers (used by TaggerServer and McpServer) ─────────────
 
-    /** Escape a string for safe embedding inside a JSON double-quoted value. */
+    /**
+     * Escape a string for safe embedding inside a JSON double-quoted value.
+     * A null input is treated as the empty string so callers building responses
+     * from possibly-incomplete records (e.g. a Tag with a missing id or type)
+     * don't crash mid-response.
+     */
     static String jsonEscape(String s) {
+        if (s == null) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t");
     }
 
-    /** Serialize a tag result into the standard response envelope. */
+    /** Serialize a tag result into the standard ("simple") response envelope. */
     static String toJson(String text, List<Tag> tags, long elapsedMs) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\n")
@@ -518,6 +524,105 @@ public class App {
     }
 
     /**
+     * Serialize a tag result into the Solr Text Tagger response format.
+     *
+     * <pre>
+     * {
+     *   "totalTime": 1,
+     *   "response": {
+     *     "numFound": 1,
+     *     "start": 0,
+     *     "docs": [
+     *       { "id": "123", "name": ["Samsung"], "type": "brand" }
+     *     ]
+     *   },
+     *   "tags": [
+     *     { "startOffset": 0, "endOffset": 7, "ids": ["123"] }
+     *   ]
+     * }
+     * </pre>
+     *
+     * Behaviour:
+     *   • {@code response.docs} contains one entry per unique entity id, with
+     *     {@code name} as the deduplicated, order-preserving list of surface
+     *     forms that matched it in this request.
+     *   • {@code tags} groups ids by their (startOffset, endOffset) span so
+     *     overlapping or co-located matches share a single tag entry.
+     *   • {@code totalTime} is the elapsed milliseconds for this request
+     *     (mirrors the {@code totaltime} field in the simple format).
+     */
+    static String toSolrJson(String text, List<Tag> tags, long elapsedMs) {
+        // Group surface forms (and remember type) per unique entity id —
+        // LinkedHashMap/Set preserves the order tags were emitted in.
+        LinkedHashMap<String, LinkedHashSet<String>> namesById = new LinkedHashMap<>();
+        LinkedHashMap<String, String>                typeById  = new LinkedHashMap<>();
+        for (Tag t : tags) {
+            namesById.computeIfAbsent(t.id(), k -> new LinkedHashSet<>()).add(t.surface());
+            typeById.putIfAbsent(t.id(), t.type());
+        }
+
+        // Group ids by (start, end) span — Solr emits one tag per span.
+        LinkedHashMap<Long, int[]>                  spanMeta  = new LinkedHashMap<>();
+        LinkedHashMap<Long, LinkedHashSet<String>>  idsBySpan = new LinkedHashMap<>();
+        for (Tag t : tags) {
+            long key = ((long) t.start() << 32) | (t.end() & 0xFFFFFFFFL);
+            spanMeta.putIfAbsent(key, new int[]{ t.start(), t.end() });
+            idsBySpan.computeIfAbsent(key, k -> new LinkedHashSet<>()).add(t.id());
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n")
+          .append("  \"totalTime\": ").append(elapsedMs).append(",\n")
+          .append("  \"response\": {\n")
+          .append("    \"numFound\": ").append(namesById.size()).append(",\n")
+          .append("    \"start\": 0,\n")
+          .append("    \"docs\": [");
+
+        boolean firstDoc = true;
+        for (Map.Entry<String, LinkedHashSet<String>> e : namesById.entrySet()) {
+            sb.append(firstDoc ? "\n" : ",\n");
+            firstDoc = false;
+            sb.append("      {")
+              .append("\"id\":\"").append(jsonEscape(e.getKey())).append("\",")
+              .append("\"name\":[");
+            boolean firstName = true;
+            for (String name : e.getValue()) {
+                if (!firstName) sb.append(',');
+                firstName = false;
+                sb.append('"').append(jsonEscape(name)).append('"');
+            }
+            sb.append("],")
+              .append("\"type\":\"").append(jsonEscape(typeById.get(e.getKey()))).append("\"")
+              .append('}');
+        }
+        if (!namesById.isEmpty()) sb.append("\n    ");
+        sb.append("]\n  },\n")
+          .append("  \"tags\": [");
+
+        boolean firstSpan = true;
+        for (Map.Entry<Long, LinkedHashSet<String>> e : idsBySpan.entrySet()) {
+            int[] span = spanMeta.get(e.getKey());
+            sb.append(firstSpan ? "\n" : ",\n");
+            firstSpan = false;
+            sb.append("    {")
+              .append("\"startOffset\":").append(span[0]).append(',')
+              .append("\"endOffset\":").append(span[1]).append(',')
+              .append("\"ids\":[");
+            boolean firstId = true;
+            for (String id : e.getValue()) {
+                if (!firstId) sb.append(',');
+                firstId = false;
+                sb.append('"').append(jsonEscape(id)).append('"');
+            }
+            sb.append("]}");
+        }
+        if (!idsBySpan.isEmpty()) sb.append("\n  ");
+        sb.append("]\n}");
+
+        return sb.toString();
+    }
+
+    /**
      * Minimal HTTP server built on the JDK's built-in com.sun.net.httpserver API.
      *
      * Endpoints
@@ -542,6 +647,8 @@ public class App {
 
         private static final Pattern JSON_TEXT =
             Pattern.compile("\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+        private static final Pattern JSON_FORMAT =
+            Pattern.compile("\"format\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
 
         private final HttpServer  server;
         private final TextTagger  tagger;
@@ -559,16 +666,31 @@ public class App {
 
         // ── Handlers ─────────────────────────────────────────────────────────
 
-        /** GET /tag?text=... or POST /tag with JSON body {"text":"..."} */
+        /**
+         * GET  /tag?text=...[&format=simple|solr]
+         * POST /tag with JSON body {"text":"...", "format":"simple|solr"}
+         *
+         * The optional {@code format} parameter selects the response shape:
+         *   • {@code simple} (default) — {@link App#toJson(String, List, long)}
+         *   • {@code solr}             — {@link App#toSolrJson(String, List, long)}
+         */
         private void handleTag(HttpExchange ex) throws IOException {
             String method = ex.getRequestMethod();
 
             String text;
+            String format;
             if ("GET".equalsIgnoreCase(method)) {
-                text = queryParam(ex.getRequestURI().getRawQuery(), "text");
+                String rawQuery = ex.getRequestURI().getRawQuery();
+                text   = queryParam(rawQuery, "text");
+                format = queryParam(rawQuery, "format");
             } else if ("POST".equalsIgnoreCase(method)) {
                 String body = readBody(ex);
-                text = jsonTextField(body);
+                text   = jsonTextField(body);
+                format = jsonStringField(body, JSON_FORMAT);
+                // Allow ?format= on POST to override the body, useful for clients
+                // that already serialise their POST body without it.
+                String qFormat = queryParam(ex.getRequestURI().getRawQuery(), "format");
+                if (qFormat != null) format = qFormat;
             } else {
                 respond(ex, 405, "application/json", "{\"error\":\"method not allowed\"}");
                 return;
@@ -580,10 +702,23 @@ public class App {
                 return;
             }
 
+            if (format == null || format.isBlank()) format = "simple";
+            format = format.toLowerCase(Locale.ROOT);
+            if (!"simple".equals(format) && !"solr".equals(format)) {
+                respond(ex, 400, "application/json",
+                    "{\"error\":\"unknown format '" + jsonEscape(format)
+                    + "' — supported: simple, solr\"}");
+                return;
+            }
+
             long start    = System.nanoTime();
             List<Tag> tags = tagger.tag(text);
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            respond(ex, 200, "application/json", toJson(text, tags, elapsedMs));
+
+            String body = "solr".equals(format)
+                ? toSolrJson(text, tags, elapsedMs)
+                : toJson(text, tags, elapsedMs);
+            respond(ex, 200, "application/json", body);
         }
 
         /** GET /health */
@@ -616,10 +751,17 @@ public class App {
 
         /** Extract the "text" field value from a JSON object string. */
         private static String jsonTextField(String json) {
+            return jsonStringField(json, JSON_TEXT);
+        }
+
+        /**
+         * Extract a top-level JSON string field by pre-compiled pattern, then
+         * unescape the basic JSON escape sequences.  Returns null if absent.
+         */
+        private static String jsonStringField(String json, Pattern pattern) {
             if (json == null) return null;
-            Matcher m = JSON_TEXT.matcher(json);
+            Matcher m = pattern.matcher(json);
             if (!m.find()) return null;
-            // Unescape basic JSON escape sequences
             return m.group(1)
                     .replace("\\\"", "\"")
                     .replace("\\\\", "\\")

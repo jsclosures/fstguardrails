@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECR repository for the FST Guard Rails (Java Text Tagger) container image.
+  Deploy this stack first, push your image, then deploy ecs-fargate.yaml.
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: fst-guardrails
+    Description: Name of the ECR repository.
+
+  MaxImageCount:
+    Type: Number
+    Default: 10
+    Description: Lifecycle policy keeps only the N most recent images.
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the ${MaxImageCount} most recent images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": ${MaxImageCount}
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+Outputs:
+  RepositoryUri:
+    Description: ECR repository URI to push images to.
+    Value: !GetAtt Repository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryUri"
+  RepositoryName:
+    Value: !Ref Repository
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryName"

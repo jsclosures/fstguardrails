@@ -1,0 +1,444 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ECS Fargate service for FST Guard Rails (Java Text Tagger) behind an
+  internet-facing Application Load Balancer. Health-checks on /health.
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: fst-guardrails
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI, e.g. 1234.dkr.ecr.us-east-1.amazonaws.com/fst-guardrails:latest
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into (the default VPC works).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more PUBLIC subnets in different AZs (Fargate tasks get public IPs).
+  ContainerPort:
+    Type: Number
+    Default: 8080
+  DesiredCount:
+    Type: Number
+    Default: 2
+  Cpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+  Memory:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096", "8192"]
+  DataPath:
+    Type: String
+    Default: "/app/data"
+    Description: Value passed to DATA env var. Use /app/data for image-bundled CSVs.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM cert ARN. If set, the ALB also listens on 443.
+  EnableEfs:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      If true, mount an EFS file system at /data so dictionaries can be
+      hot-swapped without rebuilding the image. Also creates an "uploader"
+      task definition you can run to copy CSVs from S3 into EFS.
+  EfsThroughputMode:
+    Type: String
+    Default: bursting
+    AllowedValues: [bursting, elastic]
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  EnableEfsCondition: !Equals [!Ref EnableEfs, "true"]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ServiceName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ServiceName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - !If
+          - EnableEfsCondition
+          - PolicyName: EfsClientAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - elasticfilesystem:ClientMount
+                    - elasticfilesystem:ClientWrite
+                    - elasticfilesystem:ClientRootAccess
+                  Resource: !GetAtt EfsFileSystem.Arn
+          - !Ref AWS::NoValue
+
+  # ── EFS for hot-swappable dictionaries (only when EnableEfs=true) ──────────
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableEfsCondition
+    Properties:
+      GroupDescription: !Sub "${ServiceName} EFS NFS ingress"
+      VpcId: !Ref VpcId
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Condition: EnableEfsCondition
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: !Ref EfsThroughputMode
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${ServiceName}-data"
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Condition: EnableEfsCondition
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /data
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "0755"
+
+  EfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Condition: EnableEfsCondition
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  EfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Condition: EnableEfsCondition
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Select [1, !Ref SubnetIds]
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  EfsIngressFromService:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnableEfsCondition
+    Properties:
+      GroupId: !Ref EfsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref ServiceSecurityGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Volumes: !If
+        - EnableEfsCondition
+        - - Name: data
+            EFSVolumeConfiguration:
+              FilesystemId: !Ref EfsFileSystem
+              TransitEncryption: ENABLED
+              AuthorizationConfig:
+                AccessPointId: !Ref EfsAccessPoint
+                IAM: ENABLED
+        - !Ref AWS::NoValue
+      ContainerDefinitions:
+        - Name: tagger
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: !Sub "${ContainerPort}"
+            - Name: DATA
+              Value: !If [EnableEfsCondition, "/data", !Ref DataPath]
+          MountPoints: !If
+            - EnableEfsCondition
+            - - SourceVolume: data
+                ContainerPath: /data
+                ReadOnly: false
+            - !Ref AWS::NoValue
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -fsS http://localhost:${ContainerPort}/health || exit 1"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: tagger
+
+  # ── One-shot uploader: copies s3://bucket/prefix → EFS:/data ──────────────
+  UploaderTaskRole:
+    Type: AWS::IAM::Role
+    Condition: EnableEfsCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EfsAndS3Read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !GetAtt EfsFileSystem.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: "*"
+
+  UploaderTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: EnableEfsCondition
+    Properties:
+      Family: !Sub "${ServiceName}-uploader"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt UploaderTaskRole.Arn
+      Volumes:
+        - Name: data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EfsFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EfsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: uploader
+          Image: public.ecr.aws/aws-cli/aws-cli:latest
+          Essential: true
+          # Override `Command` at run-task time with the source S3 URI:
+          #   --overrides '{"containerOverrides":[{"name":"uploader","command":["s3","sync","s3://my-bucket/prefix/","/data/","--delete"]}]}'
+          Command: ["s3", "ls"]
+          MountPoints:
+            - SourceVolume: data
+              ContainerPath: /data
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: uploader
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ServiceName} ALB ingress"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - !If
+          - HasCertificate
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+          - !Ref AWS::NoValue
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${ServiceName} Fargate tasks"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ServiceName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ServiceName}-tg"
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref ServiceSecurityGroup]
+      LoadBalancers:
+        - ContainerName: tagger
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: 10
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ServiceName}-cpu-target"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+Outputs:
+  ServiceUrl:
+    Description: Public HTTP URL of the tagger service.
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  HealthUrl:
+    Value: !Sub "http://${LoadBalancer.DNSName}/health"
+  TagExample:
+    Value: !Sub "http://${LoadBalancer.DNSName}/tag?text=Ada+Lovelace+uses+Apache+Lucene"
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceArn:
+    Value: !Ref Service
+  EfsFileSystemId:
+    Condition: EnableEfsCondition
+    Value: !Ref EfsFileSystem
+    Export:
+      Name: !Sub "${AWS::StackName}-EfsFileSystemId"
+  EfsAccessPointId:
+    Condition: EnableEfsCondition
+    Value: !Ref EfsAccessPoint
+  UploaderTaskDefinitionArn:
+    Condition: EnableEfsCondition
+    Value: !Ref UploaderTaskDefinition
+    Export:
+      Name: !Sub "${AWS::StackName}-UploaderTaskDef"
+  ServiceSecurityGroupId:
+    Value: !Ref ServiceSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceSG"

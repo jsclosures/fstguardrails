@@ -1,0 +1,49 @@
+# AWS App Runner config for FST Guard Rails (Java Text Tagger).
+#
+# Usage option A (image-based, recommended):
+#   1. Push the Docker image to ECR (see ../README.md).
+#   2. In the App Runner console, create a service "From container registry"
+#      pointing at your ECR image. Use the settings in the "ImageConfiguration"
+#      block below.
+#
+# Usage option B (source-based):
+#   Place this file at the repo root as `apprunner.yaml` and connect a GitHub
+#   source. App Runner will run the build/run commands below.
+
+version: 1.0
+runtime: docker
+build:
+  commands:
+    build:
+      - mvn package -q -DskipTests
+run:
+  runtime-version: latest
+  command: java -jar target/tagger.jar serve
+  network:
+    port: 8080
+    env: PORT
+  env:
+    - name: DATA
+      value: /app/data
+
+# ─── Reference settings to apply in the App Runner console ──────────────────
+# ImageConfiguration:
+#   Port: 8080
+#   RuntimeEnvironmentVariables:
+#     PORT: "8080"
+#     DATA: "/app/data"
+#   StartCommand: (leave blank — uses image ENTRYPOINT)
+# InstanceConfiguration:
+#   Cpu: 1 vCPU
+#   Memory: 2 GB
+# HealthCheckConfiguration:
+#   Protocol: HTTP
+#   Path: /health
+#   Interval: 10
+#   Timeout: 5
+#   HealthyThreshold: 1
+#   UnhealthyThreshold: 3
+# AutoScalingConfiguration:
+#   MinSize: 1
+#   MaxSize: 5
+#   MaxConcurrency: 100

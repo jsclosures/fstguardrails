@@ -60,8 +60,32 @@ Port defaults to `8080`, overridden by the `PORT` env var or a positional argume
 
 | Method | Path | Input | Output |
 |--------|------|-------|--------|
-| GET | `/tag?text=Ada+Lovelace+loves+Lucene` | URL-encoded text | `{totaltime, text, docs:[]}` |
-| POST | `/tag` | `{"text":"Ada Lovelace loves Lucene"}` | `{totaltime, text, docs:[]}` |
+| GET | `/tag?text=Ada+Lovelace+loves+Lucene[&format=simple\|solr]` | URL-encoded text | `{totaltime, text, docs:[]}` (default) or Solr Text Tagger envelope |
+| POST | `/tag` | `{"text":"Ada Lovelace loves Lucene", "format":"simple\|solr"}` | same as GET |
+| GET | `/health` | — | `{"status":"ok"}` |
+
+The optional `format` parameter selects the response shape:
+
+- **`simple`** (default) — `{totaltime, text, docs:[{start,end,surface,id,type,output}, ...]}`. One entry per matched (span × id) pair.
+- **`solr`** — Solr Text Tagger style envelope:
+
+  ```json
+  {
+    "totalTime": 1,
+    "response": {
+      "numFound": 1,
+      "start": 0,
+      "docs": [
+        { "id": "123", "name": ["Samsung"], "type": "brand" }
+      ]
+    },
+    "tags": [
+      { "startOffset": 0, "endOffset": 7, "ids": ["123"] }
+    ]
+  }
+  ```
+
+  `response.docs[]` has one entry per unique entity id (with `name` as the deduplicated list of surface forms that matched), and `tags[]` groups all ids that resolved to the same `(startOffset, endOffset)` span. Unknown `format` values return HTTP 400.
 | GET | `/health` | — | `{"status":"ok"}` |
 
 **Example responses:**

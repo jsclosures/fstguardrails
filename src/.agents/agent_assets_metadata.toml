@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "LEfPh1oAOuXDK-8BVN2kn"
+uri = "file://java-tagger-demo/PROMPT-csv-data-loader.md"
+type = "text"
+title = "Prompt: Add CSV data loading to App.java"
